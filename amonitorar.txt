@@ -1,0 +1,43 @@
+{
+    "opacity": 92,
+    "window": {
+        "x": 100,
+        "y": 100,
+        "width": 350,
+        "height": 480
+    },
+    "monitors": [
+        {
+            "id": "srv-1",
+            "name": "Cloudflare DNS",
+            "type": "PING",
+            "target": "1.1.1.1",
+            "port": 0,
+            "interval": 5
+        },
+        {
+            "id": "srv-2",
+            "name": "Google DNS",
+            "type": "PING",
+            "target": "8.8.8.8",
+            "port": 0,
+            "interval": 5
+        },
+        {
+            "id": "srv-3",
+            "name": "Web Portal (HTTPS)",
+            "type": "HTTP",
+            "target": "https://www.google.com",
+            "port": 443,
+            "interval": 10
+        },
+        {
+            "id": "srv-4",
+            "name": "SSH Gateway",
+            "type": "TCP",
+            "target": "github.com",
+            "port": 22,
+            "interval": 8
+        }
+    ]
+}
