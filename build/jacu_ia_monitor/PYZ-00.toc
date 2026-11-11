@@ -1,4 +1,4 @@
-('C:\\programacao\\jacuMonitor\\build\\jacu_monitor\\PYZ-00.pyz',
+('C:\\programacao\\jacuMonitor\\build\\jacu_ia_monitor\\PYZ-00.pyz',
  [('PyQt6',
    'C:\\Users\\Werber\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python313\\site-packages\\PyQt6\\__init__.py',
    'PYMODULE'),

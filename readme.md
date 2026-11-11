@@ -48,7 +48,7 @@ pip install PyQt6
 
 ### 3. Rodar o aplicativo
 ```bash
-python jacu_monitor.py
+python jacu_ia_monitor.py
 ```
 
 ---
@@ -141,10 +141,14 @@ O arquivo `amonitorar.txt` é gerado automaticamente na raiz do projeto em forma
 
 ## 📦 Gerando um Executável Standalone (`.exe`)
 
-Para compilar em um único arquivo `.exe` sem necessidade de ter o Python instalado na máquina de destino:
+Para compilar em um único arquivo executável sem a necessidade de ter o Python instalado na máquina de destino:
 
 ```bash
 pip install pyinstaller
-pyinstaller --noconsole --onefile jacu_monitor.py
+python -m PyInstaller --noconsole --onefile --name "jacu_ia_monitor" jacu_ia_monitor.py
 ```
-O executável final estará pronto dentro da pasta `dist/jacu_monitor.exe`.
+
+O executável compilado estará disponível no caminho:
+```text
+dist/jacu_ia_monitor.exe
+```
