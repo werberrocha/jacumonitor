@@ -7,10 +7,12 @@ Description:
     Monitors servers and network services (ICMP Ping, TCP Ports, HTTP/HTTPS endpoints).
     Features:
       - Always-On-Top toggleable floating gadget mode.
+      - Public IP & ISP (Operadora) display with 5-minute auto-refresh & double-click force update.
       - Frameless, translucent dark mode UI with Windows 11 aesthetic.
       - Dynamic JSON-based configuration stored in `amonitorar.txt`.
       - Real-time LED indicator & sparkline heartbeat latency graph.
       - Non-blocking background worker threads with customizable interval per target.
+      - Event-based compact 30-minute rolling logs (only on initial state and status change).
       - Integrated visual manager to add, edit, test, and remove monitors.
 """
 
@@ -23,22 +25,25 @@ import subprocess
 import platform
 import urllib.request
 import urllib.error
+from datetime import datetime, timedelta
+import re
 from typing import List, Dict, Any
 
 from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QPoint, QRectF, QTimer
+    Qt, QThread, pyqtSignal, QPoint, QRectF, QTimer, QEvent
 )
 from PyQt6.QtGui import (
-    QColor, QPainter, QPen, QBrush, QPainterPath, QFont, QIcon, QMouseEvent
+    QColor, QPainter, QPen, QBrush, QPainterPath, QFont, QMouseEvent
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QScrollArea, QDialog,
     QLineEdit, QComboBox, QSpinBox, QMessageBox, QFrame,
-    QGraphicsDropShadowEffect, QSlider, QSizeGrip
+    QGraphicsDropShadowEffect, QSlider, QSizeGrip, QToolTip
 )
 
 CONFIG_FILENAME = "amonitorar.txt"
+LOGS_DIR = "logs"
 
 # Default configuration template if file does not exist
 DEFAULT_CONFIG = {
@@ -47,7 +52,7 @@ DEFAULT_CONFIG = {
         "x": 100,
         "y": 100,
         "width": 350,
-        "height": 480
+        "height": 500
     },
     "monitors": [
         {
@@ -98,7 +103,6 @@ def load_config() -> Dict[str, Any]:
     try:
         with open(CONFIG_FILENAME, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # Backward-compatibility if amonitorar.txt was previously just a list
             if isinstance(data, list):
                 return {"opacity": 92, "window": DEFAULT_CONFIG["window"], "monitors": data}
             if isinstance(data, dict):
@@ -125,6 +129,61 @@ def save_config(data: Dict[str, Any]):
 
 
 # ============================================================================
+#  Log Persistence Helpers (Compact 30-minute retention per service)
+# ============================================================================
+
+def append_service_log(monitor_id: str, monitor_target: str, is_up: bool, latency: float, origin_ip: str, origin_isp: str):
+    """
+    Appends a new status event to logs/<monitor_id>.log without verbose descriptive labels,
+    using pipe delimiter: TIMESTAMP|ORIGIN_IP|ORIGIN_ISP|TARGET|STATUS|LATENCY
+    Maintains exact 30-minute window by discarding older rows.
+    """
+    try:
+        if not os.path.exists(LOGS_DIR):
+            os.makedirs(LOGS_DIR, exist_ok=True)
+
+        safe_id = re.sub(r'[^a-zA-Z0-9_\-]', '_', monitor_id)
+        log_path = os.path.join(LOGS_DIR, f"{safe_id}.log")
+
+        now = datetime.now()
+        status_str = "UP" if is_up else "DOWN"
+        clean_target = monitor_target.replace("|", "/")
+        clean_isp = origin_isp.replace("|", "/")
+        clean_ip = origin_ip.replace("|", "/")
+        
+        # Format: TIMESTAMP|ORIGIN_IP|ORIGIN_ISP|TARGET|STATUS|LATENCY_MS
+        new_entry = f"{now.strftime('%Y-%m-%d %H:%M:%S')}|{clean_ip}|{clean_isp}|{clean_target}|{status_str}|{latency:.1f}\n"
+
+        cutoff_time = now - timedelta(minutes=30)
+        kept_lines = []
+
+        if os.path.exists(log_path):
+            with open(log_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            for line in lines:
+                parts = line.split("|")
+                if len(parts) >= 2:
+                    ts_part = parts[0].strip()
+                    if ts_part.startswith("[") and ts_part.endswith("]"):
+                        ts_part = ts_part[1:-1]
+                    try:
+                        entry_time = datetime.strptime(ts_part, "%Y-%m-%d %H:%M:%S")
+                        if entry_time >= cutoff_time:
+                            kept_lines.append(line)
+                    except ValueError:
+                        kept_lines.append(line)
+                else:
+                    kept_lines.append(line)
+
+        kept_lines.append(new_entry)
+
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.writelines(kept_lines)
+    except Exception as e:
+        print(f"Error writing log for {monitor_id}: {e}")
+
+
+# ============================================================================
 #  Network Verification Logic
 # ============================================================================
 
@@ -132,13 +191,12 @@ def check_ping(host: str, timeout_sec: float = 2.0) -> (bool, float):
     """Executes an ICMP echo ping and calculates latency in ms."""
     param = "-n" if platform.system().lower() == "windows" else "-c"
     timeout_param = "-w" if platform.system().lower() == "windows" else "-W"
-    # Windows -w is in milliseconds
     timeout_val = str(int(timeout_sec * 1000)) if platform.system().lower() == "windows" else str(int(timeout_sec))
 
     command = ["ping", param, "1", timeout_param, timeout_val, host]
     start_time = time.time()
     try:
-        creationflags = 0x08000000 if platform.system().lower() == "windows" else 0  # CREATE_NO_WINDOW
+        creationflags = 0x08000000 if platform.system().lower() == "windows" else 0
         res = subprocess.run(
             command,
             stdout=subprocess.DEVNULL,
@@ -182,11 +240,54 @@ def check_http(url: str, timeout_sec: float = 3.0) -> (bool, float):
             status_ok = (200 <= response.status < 400)
             return (status_ok, round(latency, 1))
     except urllib.error.HTTPError as e:
-        # HTTP errors like 401 Unauthorized or 403 Forbidden indicate the host & service are alive
         latency = (time.time() - start_time) * 1000.0
         return (e.code < 500, round(latency, 1))
     except Exception:
         return (False, 0.0)
+
+
+# ============================================================================
+#  Public IP & ISP Discovery Worker
+# ============================================================================
+
+class PublicIpWorker(QThread):
+    """Fetches public IP and ISP details asynchronously."""
+    ip_info_ready = pyqtSignal(str, str)
+
+    def run(self):
+        ip = "Desconhecido"
+        isp = "Sem conexão"
+
+        try:
+            req = urllib.request.Request(
+                "http://ip-api.com/json/?fields=query,isp,status",
+                headers={"User-Agent": "jacu.ia-monitor/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=4.0) as res:
+                data = json.loads(res.read().decode("utf-8"))
+                if data.get("status") == "success":
+                    ip = data.get("query", "Desconhecido")
+                    isp = data.get("isp", "Desconhecida")
+                    self.ip_info_ready.emit(ip, isp)
+                    return
+        except Exception:
+            pass
+
+        try:
+            req = urllib.request.Request(
+                "https://api.ipify.org?format=json",
+                headers={"User-Agent": "jacu.ia-monitor/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=4.0) as res:
+                data = json.loads(res.read().decode("utf-8"))
+                ip = data.get("ip", "Desconhecido")
+                isp = "Detectado via Ipify"
+                self.ip_info_ready.emit(ip, isp)
+                return
+        except Exception:
+            pass
+
+        self.ip_info_ready.emit(ip, isp)
 
 
 # ============================================================================
@@ -195,7 +296,7 @@ def check_http(url: str, timeout_sec: float = 3.0) -> (bool, float):
 
 class MonitorWorker(QThread):
     """Background worker thread for an individual monitor item."""
-    result_ready = pyqtSignal(str, bool, float)  # id, is_up, latency_ms
+    result_ready = pyqtSignal(str, bool, float)
 
     def __init__(self, monitor_data: Dict[str, Any]):
         super().__init__()
@@ -234,22 +335,76 @@ class MonitorWorker(QThread):
 # ============================================================================
 
 class SparklineWidget(QWidget):
-    """Miniature heartbeat / latency sparkline with loss visualization."""
+    """Miniature heartbeat / latency sparkline with loss visualization and hover tooltips."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.history: List[float] = []
+        self.history: List[tuple[float, str]] = []
+        self.points_cache: List[tuple[float, float, float, str]] = []
         self.max_points = 24
-        self.setFixedHeight(32)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setFixedHeight(36)
+        self.setMouseTracking(True)
+        self.setToolTip("")
 
     def add_metric(self, is_up: bool, latency: float):
-        # Store negative or zero value if down to represent packet loss / outage
         val = latency if is_up else -1.0
-        self.history.append(val)
+        timestamp_str = datetime.now().strftime("%H:%M:%S")
+        self.history.append((val, timestamp_str))
         if len(self.history) > self.max_points:
             self.history.pop(0)
         self.update()
+
+    def event(self, e):
+        if e.type() == QEvent.Type.ToolTip:
+            help_event = e
+            mouse_pos = help_event.pos()
+            mx, my = mouse_pos.x(), mouse_pos.y()
+            hit = None
+
+            for pt_x, pt_y, val, ts in self.points_cache:
+                dist = ((mx - pt_x) ** 2 + (my - pt_y) ** 2) ** 0.5
+                if dist <= 7.0:
+                    hit = (val, ts)
+                    break
+
+            if hit:
+                val, ts = hit
+                if val >= 0:
+                    tip_text = f"🕒 {ts}\n⚡ Latência: {val:.1f} ms\nStatus: OK"
+                else:
+                    tip_text = f"🕒 {ts}\n⚠️ Pacote Perdido / DOWN"
+                QToolTip.showText(help_event.globalPos(), tip_text, self)
+            else:
+                QToolTip.hideText()
+            return True
+
+        return super().event(e)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        mouse_pos = event.position()
+        mx, my = mouse_pos.x(), mouse_pos.y()
+        hit = None
+
+        for pt_x, pt_y, val, ts in self.points_cache:
+            dist = ((mx - pt_x) ** 2 + (my - pt_y) ** 2) ** 0.5
+            if dist <= 7.0:
+                hit = (val, ts)
+                break
+
+        if hit:
+            val, ts = hit
+            if val >= 0:
+                tip_text = f"🕒 {ts}\n⚡ Latência: {val:.1f} ms\nStatus: OK"
+            else:
+                tip_text = f"🕒 {ts}\n⚠️ Pacote Perdido / DOWN"
+            QToolTip.showText(event.globalPosition().toPoint(), tip_text, self)
+        else:
+            QToolTip.hideText()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        QToolTip.hideText()
+        super().leaveEvent(event)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -258,32 +413,33 @@ class SparklineWidget(QWidget):
         w = self.width()
         h = self.height()
 
-        # Canvas background box
         painter.setBrush(QBrush(QColor(18, 22, 29, 180)))
         painter.setPen(QPen(QColor(255, 255, 255, 12), 1))
         painter.drawRoundedRect(0, 0, w, h, 4, 4)
 
+        self.points_cache.clear()
+
         if not self.history:
             return
 
-        # Find max latency to scale (minimum 50ms scale for visual stability)
-        valid_lats = [x for x in self.history if x >= 0]
+        valid_lats = [x[0] for x in self.history if x[0] >= 0]
         max_lat = max(valid_lats) if valid_lats else 100.0
         max_scale = max(max_lat * 1.2, 50.0)
 
-        step_x = (w - 8) / max(1, self.max_points - 1)
+        step_x = (w - 14) / max(1, self.max_points - 1)
         points = []
 
-        for i, val in enumerate(self.history):
-            x = 4 + i * step_x
+        for i, (val, ts) in enumerate(self.history):
+            x = 7 + i * step_x
             if val < 0:
-                y = h - 4  # Dropped packet stays near bottom
+                y = h - 6
             else:
                 ratio = min(val / max_scale, 1.0)
-                y = (h - 6) - (ratio * (h - 12))
-            points.append((x, y, val))
+                y = (h - 8) - (ratio * (h - 16))
+            points.append((x, y, val, ts))
 
-        # Draw area under sparkline
+        self.points_cache = list(points)
+
         if len(points) > 1:
             poly_path = QPainterPath()
             poly_path.moveTo(points[0][0], h - 3)
@@ -292,30 +448,40 @@ class SparklineWidget(QWidget):
             poly_path.lineTo(points[-1][0], h - 3)
             poly_path.closeSubpath()
 
-            # Semi-transparent gradient fill
-            fill_color = QColor(16, 185, 129, 45) if (self.history[-1] >= 0) else QColor(239, 68, 68, 45)
+            fill_color = QColor(16, 185, 129, 40) if (self.history[-1][0] >= 0) else QColor(239, 68, 68, 40)
             painter.fillPath(poly_path, QBrush(fill_color))
 
-        # Draw sparkline path
         for i in range(len(points) - 1):
             p1 = points[i]
             p2 = points[i + 1]
 
             if p2[2] < 0:
-                line_pen = QPen(QColor(239, 68, 68, 220), 1.5, Qt.PenStyle.DashLine)
+                line_pen = QPen(QColor(239, 68, 68, 210), 1.2, Qt.PenStyle.DashLine)
             else:
-                line_pen = QPen(QColor(52, 211, 153, 230), 1.8)
+                line_pen = QPen(QColor(52, 211, 153, 220), 1.4)
 
             painter.setPen(line_pen)
             painter.drawLine(int(p1[0]), int(p1[1]), int(p2[0]), int(p2[1]))
 
-        # Pulse circle at head
+        for pt in points:
+            x, y, val, _ = pt
+            if val >= 0:
+                p_border = QColor(16, 185, 129, 220)
+                p_fill = QColor(52, 211, 153)
+            else:
+                p_border = QColor(220, 38, 38, 220)
+                p_fill = QColor(248, 113, 113)
+
+            painter.setPen(QPen(p_border, 1.0))
+            painter.setBrush(QBrush(p_fill))
+            painter.drawEllipse(QPoint(int(x), int(y)), 2, 2)
+
         if points:
             last = points[-1]
-            head_color = QColor(52, 211, 153) if last[2] >= 0 else QColor(239, 68, 68)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QBrush(head_color))
-            painter.drawEllipse(QPoint(int(last[0]), int(last[1])), 2, 2)
+            pulse_ring = QColor(52, 211, 153, 90) if last[2] >= 0 else QColor(239, 68, 68, 90)
+            painter.setPen(QPen(pulse_ring, 1.2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(QPoint(int(last[0]), int(last[1])), 4, 4)
 
 
 class StatusLed(QWidget):
@@ -337,23 +503,90 @@ class StatusLed(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         if not self.has_data:
-            base_col = QColor(148, 163, 184)  # Slate pending
+            base_col = QColor(148, 163, 184)
             glow_col = QColor(148, 163, 184, 50)
         elif self.is_up:
-            base_col = QColor(16, 185, 129)  # Emerald UP
+            base_col = QColor(16, 185, 129)
             glow_col = QColor(16, 185, 129, 70)
         else:
-            base_col = QColor(239, 68, 68)  # Crimson ALARM
+            base_col = QColor(239, 68, 68)
             glow_col = QColor(239, 68, 68, 80)
 
-        # Glow halo
         painter.setBrush(QBrush(glow_col))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(1, 1, 12, 12)
 
-        # Bright center dot
         painter.setBrush(QBrush(base_col))
         painter.drawEllipse(3, 3, 8, 8)
+
+
+# ============================================================================
+#  Public Network Info Card (IP & ISP)
+# ============================================================================
+
+class PublicNetworkBadge(QFrame):
+    """Interactive bar showing Public IP and ISP, with double-click manual refresh."""
+    refresh_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("IP e Provedor da sua conexão de internet.\nClique duplo para forçar atualização imediata.")
+        self.setObjectName("publicNetworkBadge")
+        self.setStyleSheet("""
+            QFrame#publicNetworkBadge {
+                background-color: rgba(30, 41, 59, 0.65);
+                border: 1px solid rgba(56, 189, 248, 0.20);
+                border-radius: 6px;
+                padding: 2px;
+            }
+            QFrame#publicNetworkBadge:hover {
+                background-color: rgba(30, 41, 59, 0.90);
+                border: 1px solid rgba(56, 189, 248, 0.45);
+            }
+        """)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(6)
+
+        self.lbl_icon = QLabel("🌐")
+        self.lbl_icon.setStyleSheet("font-size: 11px;")
+        layout.addWidget(self.lbl_icon)
+
+        self.lbl_ip = QLabel("IP: Consultando…")
+        self.lbl_ip.setStyleSheet("font-size: 10px; font-weight: 700; color: #38BDF8;")
+        layout.addWidget(self.lbl_ip)
+
+        self.lbl_sep = QLabel("•")
+        self.lbl_sep.setStyleSheet("color: #475569; font-size: 10px;")
+        layout.addWidget(self.lbl_sep)
+
+        self.lbl_isp = QLabel("Operadora: …")
+        self.lbl_isp.setStyleSheet("font-size: 10px; color: #94A3B8;")
+        layout.addWidget(self.lbl_isp, 1)
+
+    def set_loading(self):
+        self.lbl_ip.setText("IP: Atualizando…")
+        self.lbl_isp.setText("Operadora: …")
+        self.lbl_ip.setStyleSheet("font-size: 10px; font-weight: 700; color: #FBBF24;")
+
+    def update_info(self, ip: str, isp: str):
+        display_isp = isp
+        if len(display_isp) > 22:
+            display_isp = display_isp[:20] + "…"
+
+        self.lbl_ip.setText(f"IP: {ip}")
+        self.lbl_isp.setText(f"{display_isp}")
+        self.lbl_ip.setStyleSheet("font-size: 10px; font-weight: 700; color: #38BDF8;")
+        self.lbl_isp.setStyleSheet("font-size: 10px; color: #CBD5E1;")
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.refresh_requested.emit()
+            event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
 
 
 # ============================================================================
@@ -386,7 +619,6 @@ class MonitorCard(QFrame):
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(4)
 
-        # Top row: LED, Service Name, Type Tag
         top_layout = QHBoxLayout()
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.setSpacing(6)
@@ -412,7 +644,6 @@ class MonitorCard(QFrame):
 
         layout.addLayout(top_layout)
 
-        # Sub-info row: Target & Latency readout
         sub_layout = QHBoxLayout()
         sub_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -433,10 +664,13 @@ class MonitorCard(QFrame):
         layout.addLayout(sub_layout)
 
         # Heartbeat latency sparkline
-        self.sparkline = SparklineWidget()
+        self.sparkline = SparklineWidget(self)
         layout.addWidget(self.sparkline)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
+        child = self.childAt(event.position().toPoint())
+        if child == self.sparkline:
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             self.double_clicked.emit(self.data.get("id"))
             event.accept()
@@ -684,7 +918,6 @@ class ServiceManagerDialog(QDialog):
         op_box.addWidget(self.lbl_opacity_val)
         layout.addLayout(op_box)
 
-        # Divider
         div1 = QFrame()
         div1.setFrameShape(QFrame.Shape.HLine)
         div1.setStyleSheet("color: #334155;")
@@ -734,7 +967,6 @@ class ServiceManagerDialog(QDialog):
         self.btn_add.clicked.connect(self.add_monitor)
         layout.addWidget(self.btn_add)
 
-        # Divider
         div2 = QFrame()
         div2.setFrameShape(QFrame.Shape.HLine)
         div2.setStyleSheet("color: #334155;")
@@ -760,7 +992,6 @@ class ServiceManagerDialog(QDialog):
         self.scroll.setWidget(self.list_container)
         layout.addWidget(self.scroll, 1)
 
-        # Bottom Actions
         btn_box = QHBoxLayout()
         btn_box.addStretch()
 
@@ -776,7 +1007,6 @@ class ServiceManagerDialog(QDialog):
     def on_opacity_change(self, val: int):
         self.opacity_val = val
         self.lbl_opacity_val.setText(f"{val}%")
-        # Live preview if parent gadget is active
         if self.parent():
             self.parent().setWindowOpacity(val / 100.0)
 
@@ -818,7 +1048,6 @@ class ServiceManagerDialog(QDialog):
             r_lay.setContentsMargins(8, 6, 8, 6)
             r_lay.setSpacing(6)
 
-            # Reorder Buttons (Up / Down)
             btn_up = QPushButton("▲")
             btn_up.setFixedSize(22, 22)
             btn_up.setEnabled(idx > 0)
@@ -861,7 +1090,6 @@ class ServiceManagerDialog(QDialog):
             btn_down.clicked.connect(lambda _, i=idx: self.move_down(i))
             r_lay.addWidget(btn_down)
 
-            # Position indicator
             num_lbl = QLabel(f"#{idx + 1}")
             num_lbl.setStyleSheet("color: #64748B; font-weight: bold; font-size: 11px;")
             r_lay.addWidget(num_lbl)
@@ -967,21 +1195,31 @@ class JacuMonitorGadget(QMainWindow):
         self.config = load_config()
         self.monitors: List[Dict[str, Any]] = self.config.get("monitors", [])
         self.opacity_val: int = int(self.config.get("opacity", 92))
-        self.window_geom = self.config.get("window", {"x": 100, "y": 100, "width": 350, "height": 480})
+        self.window_geom = self.config.get("window", {"x": 100, "y": 100, "width": 350, "height": 500})
         self.workers: Dict[str, MonitorWorker] = {}
         self.cards: Dict[str, MonitorCard] = {}
         self.is_always_on_top = True
         self.drag_position = QPoint()
 
+        # Origin IP & ISP state
+        self.current_origin_ip = "Desconhecido"
+        self.current_origin_isp = "Desconhecida"
+
+        # Tracks last known status per monitor_id (None: uninitialized, True: UP, False: DOWN)
+        self.last_status: Dict[str, bool] = {}
+
+        self.ip_worker = None
+        self.ip_timer = QTimer(self)
+
         self.init_window_properties()
         self.init_ui()
+        self.init_ip_updater()
         self.start_monitoring()
 
     def init_window_properties(self):
         self.setWindowTitle("jacu.ia monitor")
-        self.setMinimumSize(300, 200)
+        self.setMinimumSize(300, 220)
 
-        # Frameless and translucent acrylic-styled window
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowOpacity(self.opacity_val / 100.0)
         self.update_window_flags()
@@ -990,16 +1228,14 @@ class JacuMonitorGadget(QMainWindow):
     def restore_window_geometry(self):
         """Restores position and dimensions, validating against available screens."""
         w = max(300, int(self.window_geom.get("width", 350)))
-        h = max(200, int(self.window_geom.get("height", 480)))
+        h = max(220, int(self.window_geom.get("height", 500)))
         x = int(self.window_geom.get("x", 100))
         y = int(self.window_geom.get("y", 100))
 
-        # Check if saved position is visible on any connected screen
         screens = QApplication.screens()
         is_visible = False
         for screen in screens:
             geom = screen.geometry()
-            # If the top-left area is inside one of the monitors
             if geom.intersects(QRectF(x, y, min(w, 100), min(h, 100)).toRect()):
                 is_visible = True
                 break
@@ -1007,7 +1243,6 @@ class JacuMonitorGadget(QMainWindow):
         if is_visible:
             self.setGeometry(x, y, w, h)
         else:
-            # Fallback to primary screen center if monitor setup changed
             if screens:
                 primary = screens[0].availableGeometry()
                 fallback_x = primary.x() + (primary.width() - w) // 2
@@ -1036,7 +1271,6 @@ class JacuMonitorGadget(QMainWindow):
         self.show()
 
     def init_ui(self):
-        # Master Container with rounded corners & dark acrylic glass styling
         self.central_container = QFrame(self)
         self.central_container.setObjectName("gadgetContainer")
         self.central_container.setStyleSheet("""
@@ -1071,7 +1305,6 @@ class JacuMonitorGadget(QMainWindow):
             }
         """)
 
-        # Soft drop shadow for Windows 11 floating HUD feel
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(24)
         shadow.setColor(QColor(0, 0, 0, 160))
@@ -1084,14 +1317,10 @@ class JacuMonitorGadget(QMainWindow):
         root_layout.setContentsMargins(12, 10, 12, 6)
         root_layout.setSpacing(6)
 
-        # -----------------------------
-        # Header / Drag Bar
-        # -----------------------------
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(6)
 
-        # Logo / Title
         title_box = QHBoxLayout()
         icon_lbl = QLabel("⚡")
         icon_lbl.setStyleSheet("font-size: 14px; color: #38BDF8;")
@@ -1120,7 +1349,6 @@ class JacuMonitorGadget(QMainWindow):
         header.addLayout(title_box)
         header.addStretch()
 
-        # Always-on-top toggle button
         self.btn_pin = QPushButton("📌")
         self.btn_pin.setToolTip("Fixar sobre outros programas (Always on Top)")
         self.btn_pin.setFixedSize(26, 26)
@@ -1128,7 +1356,6 @@ class JacuMonitorGadget(QMainWindow):
         self.btn_pin.clicked.connect(self.toggle_always_on_top)
         header.addWidget(self.btn_pin)
 
-        # Manage Services Button
         btn_manage = QPushButton("⚙")
         btn_manage.setToolTip("Gerenciar / Adicionar Servidores")
         btn_manage.setFixedSize(26, 26)
@@ -1148,7 +1375,6 @@ class JacuMonitorGadget(QMainWindow):
         btn_manage.clicked.connect(self.open_manager)
         header.addWidget(btn_manage)
 
-        # Close App Button
         btn_close = QPushButton("✕")
         btn_close.setToolTip("Fechar jacu.ia monitor")
         btn_close.setFixedSize(26, 26)
@@ -1170,9 +1396,10 @@ class JacuMonitorGadget(QMainWindow):
 
         root_layout.addLayout(header)
 
-        # -----------------------------
-        # Scrollable Cards Viewport
-        # -----------------------------
+        self.network_badge = PublicNetworkBadge(self)
+        self.network_badge.refresh_requested.connect(self.fetch_public_ip)
+        root_layout.addWidget(self.network_badge)
+
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setStyleSheet("background: transparent; border: none;")
@@ -1185,7 +1412,6 @@ class JacuMonitorGadget(QMainWindow):
         self.scroll_area.setWidget(self.cards_container)
         root_layout.addWidget(self.scroll_area, 1)
 
-        # Footer row with resize grip
         footer_layout = QHBoxLayout()
         footer_layout.setContentsMargins(0, 0, 0, 0)
         footer_layout.addStretch()
@@ -1194,8 +1420,28 @@ class JacuMonitorGadget(QMainWindow):
         footer_layout.addWidget(self.size_grip)
         root_layout.addLayout(footer_layout)
 
-        # Populate cards
         self.rebuild_cards()
+
+    def init_ip_updater(self):
+        """Sets up 5-minute periodic update and initial fetch for IP & ISP."""
+        self.fetch_public_ip()
+        self.ip_timer.setInterval(5 * 60 * 1000)
+        self.ip_timer.timeout.connect(self.fetch_public_ip)
+        self.ip_timer.start()
+
+    def fetch_public_ip(self):
+        """Asynchronously updates public IP and ISP information."""
+        if self.ip_worker and self.ip_worker.isRunning():
+            return
+        self.network_badge.set_loading()
+        self.ip_worker = PublicIpWorker()
+        self.ip_worker.ip_info_ready.connect(self.on_public_ip_received)
+        self.ip_worker.start()
+
+    def on_public_ip_received(self, ip: str, isp: str):
+        self.current_origin_ip = ip
+        self.current_origin_isp = isp
+        self.network_badge.update_info(ip, isp)
 
     def _get_pin_btn_style(self, active: bool) -> str:
         if active:
@@ -1223,7 +1469,6 @@ class JacuMonitorGadget(QMainWindow):
         """
 
     def rebuild_cards(self):
-        # Remove all existing card widgets
         while self.cards_layout.count():
             item = self.cards_layout.takeAt(0)
             if item.widget():
@@ -1247,7 +1492,6 @@ class JacuMonitorGadget(QMainWindow):
         self.cards_layout.addStretch()
 
     def edit_monitor_by_id(self, monitor_id: str):
-        """Opens Edit dialog when user double-clicks a card in the HUD."""
         for idx, m in enumerate(self.monitors):
             if m.get("id") == monitor_id:
                 diag = EditServiceDialog(m, self)
@@ -1255,12 +1499,14 @@ class JacuMonitorGadget(QMainWindow):
                     self.monitors[idx] = diag.get_data()
                     self.config["monitors"] = self.monitors
                     save_config(self.config)
+                    # Reset tracked state for this item
+                    if monitor_id in self.last_status:
+                        del self.last_status[monitor_id]
                     self.rebuild_cards()
                     self.start_monitoring()
                 break
 
     def start_monitoring(self):
-        """Starts worker threads for each configured monitor item."""
         self.stop_all_workers()
 
         for m in self.monitors:
@@ -1275,38 +1521,54 @@ class JacuMonitorGadget(QMainWindow):
             worker.stop()
         self.workers.clear()
 
+        if self.ip_worker and self.ip_worker.isRunning():
+            self.ip_worker.wait(1000)
+
     def on_metric_received(self, monitor_id: str, is_up: bool, latency: float):
+        # Always update UI and real-time sparkline graph
         if monitor_id in self.cards:
             self.cards[monitor_id].update_status(is_up, latency)
 
+        # Log only on initial collection OR when there is an actual change of status
+        previous_status = self.last_status.get(monitor_id, None)
+        if previous_status is None or previous_status != is_up:
+            self.last_status[monitor_id] = is_up
+            for m in self.monitors:
+                if m.get("id") == monitor_id:
+                    append_service_log(
+                        monitor_id=monitor_id,
+                        monitor_target=f"{m.get('name')} ({m.get('target')})",
+                        is_up=is_up,
+                        latency=latency,
+                        origin_ip=self.current_origin_ip,
+                        origin_isp=self.current_origin_isp
+                    )
+                    break
+
     def toggle_always_on_top(self):
-        """Toggles window over other active applications."""
         self.is_always_on_top = not self.is_always_on_top
         self.btn_pin.setStyleSheet(self._get_pin_btn_style(self.is_always_on_top))
         self.update_window_flags()
 
     def open_manager(self):
-        """Opens the configuration manager dialog to add/edit/reorder targets and opacity."""
         dialog = ServiceManagerDialog(self.monitors, self.opacity_val, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.monitors = dialog.get_updated_monitors()
             self.opacity_val = dialog.get_updated_opacity()
             self.setWindowOpacity(self.opacity_val / 100.0)
 
-            # Persist changes to amonitorar.txt
             self.config["monitors"] = self.monitors
             self.config["opacity"] = self.opacity_val
             save_config(self.config)
 
+            # Clear state cache so new/reordered items log their initial state correctly
+            self.last_status.clear()
+
             self.rebuild_cards()
             self.start_monitoring()
         else:
-            # Revert opacity preview if canceled
             self.setWindowOpacity(self.opacity_val / 100.0)
 
-    # -------------------------------------------------------------
-    # Window dragging handlers for Frameless HUD
-    # -------------------------------------------------------------
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
             self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -1326,7 +1588,6 @@ class JacuMonitorGadget(QMainWindow):
         self.save_window_geometry()
 
     def quit_application(self):
-        """Cleanly terminates monitoring threads, saves window state, and exits app."""
         self.save_window_geometry()
         self.stop_all_workers()
         QApplication.quit()
@@ -1343,12 +1604,10 @@ class JacuMonitorGadget(QMainWindow):
 # ============================================================================
 
 def main():
-    # High DPI scaling for crisp Windows 11 rendering
     os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
-    # Global typography
     font = QFont("Segoe UI", 9)
     app.setFont(font)
 

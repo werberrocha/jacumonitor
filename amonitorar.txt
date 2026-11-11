@@ -1,10 +1,10 @@
 {
     "opacity": 92,
     "window": {
-        "x": 100,
-        "y": 100,
-        "width": 350,
-        "height": 480
+        "x": -1059,
+        "y": 106,
+        "width": 434,
+        "height": 515
     },
     "monitors": [
         {
