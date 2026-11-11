@@ -1,4 +1,4 @@
-# jacu.ia monitor (beta 0.5)
+# jacu.ia monitor (beta 0.55)
 
 > Gadget / HUD moderno e ultraleve para Windows 11 desenvolvido em Python (PyQt6) para monitoramento em tempo real de servidores, portas e endpoints.
 
@@ -55,7 +55,7 @@ pip install PyQt6
 
 ### 3. Rodar o aplicativo
 ```bash
-python jacu_monitor.py
+python jacu_ia_monitor.py
 ```
 
 > **Dica**: Certifique-se de que os arquivos `up.mp3` e `down.mp3` (com duração de até 3 segundos cada) estejam na pasta do executável para ouvir os alertas sonoros.
@@ -160,7 +160,7 @@ Para compilar em um único arquivo executável sem a necessidade de ter o Python
 
 ```bash
 pip install pyinstaller
-python -m PyInstaller --noconsole --onefile --name "jacu_ia_monitor" jacu_monitor.py
+python -m PyInstaller --noconsole --onefile --name "jacu_ia_monitor" jacu_ia_monitor.py
 ```
 
 O executável compilado estará disponível no caminho:
