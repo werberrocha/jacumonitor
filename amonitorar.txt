@@ -3,8 +3,8 @@
     "window": {
         "x": -1059,
         "y": 106,
-        "width": 434,
-        "height": 515
+        "width": 543,
+        "height": 644
     },
     "monitors": [
         {
@@ -39,5 +39,8 @@
             "port": 22,
             "interval": 8
         }
-    ]
+    ],
+    "sound_enabled": true,
+    "up_sound": "up.mp3",
+    "down_sound": "down.mp3"
 }
