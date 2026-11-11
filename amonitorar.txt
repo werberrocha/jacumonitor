@@ -3,8 +3,8 @@
     "window": {
         "x": -1059,
         "y": 106,
-        "width": 543,
-        "height": 644
+        "width": 679,
+        "height": 805
     },
     "monitors": [
         {
@@ -38,6 +38,14 @@
             "target": "github.com",
             "port": 22,
             "interval": 8
+        },
+        {
+            "id": "item-1794416727898",
+            "name": "Site PoP-TO",
+            "type": "HTTP",
+            "target": "https://www.pop-to.rnp.br/",
+            "port": 0,
+            "interval": 15
         }
     ],
     "sound_enabled": true,

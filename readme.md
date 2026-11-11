@@ -1,4 +1,4 @@
-# jacu.ia monitor (beta 0.55)
+# jacu.ia monitor (beta 0.56)
 
 > Gadget / HUD moderno e ultraleve para Windows 11 desenvolvido em Python (PyQt6) para monitoramento em tempo real de servidores, portas e endpoints.
 
@@ -9,11 +9,13 @@
 - **Modo Gadget / HUD Always-On-Top**: Pode ficar flutuando e fixado sobre qualquer janela de jogos, IDEs ou navegadores no Windows 11.
 - **Alertas Sonoros com MP3 (UP & DOWN)**:
   - Toca arquivos `.mp3` configuráveis ao ocorrer transição de status (`up.mp3` e `down.mp3` por padrão).
+  - Resolução dinâmica de caminhos (`resolve_sound_path`), funcionando tanto como script quanto compilado (`.exe`).
+  - Fallback acústico com `winsound` caso o arquivo de áudio não esteja disponível.
   - **Validação de Duração**: O sistema valida e aceita apenas arquivos de áudio de no **máximo 3 segundos**.
   - **Botão Mute/Unmute no Cabeçalho**: Ative ou silencie os alertas sonoros diretamente no topo da janela com o botão `🔊` / `🔇`.
   - Configuração visual com botão de teste (preview) e seleção de arquivo no painel `⚙`.
-- **Checagem de Origem em Tempo Real na Queda**:
-  - Quando um evento de queda (**DOWN**) é detectado, o sistema executa uma verificação imediata de IP e Operadora para registrar a rota real no exato momento da indisponibilidade.
+- **Checagem Ativa de Origem na Queda e na Volta**:
+  - Quando um evento de queda (**DOWN**) ou recuperação (**UP**) é detectado, o sistema executa uma verificação imediata de IP e Operadora para registrar e exibir no badge a rota real no exato momento da transição.
 - **Detecção de IP Público & Operadora**: Mostra seu endereço de IP de origem e provedor/ISP em um badge no topo do painel. Atualizado automaticamente a cada **5 minutos** ou forçado com **duplo clique**.
 - **Transparência / Opacidade Ajustável**: Controle o nível de transparência da janela (de 20% a 100%) em tempo real.
 - **Gráfico de Vida (Sparkline) com Tooltip**:
@@ -70,8 +72,7 @@ Para cada serviço cadastrado, um arquivo de log individual é mantido no diret�
 Para maximizar a precisão e economizar disco:
 1. **Status Inicial**: Gravado na primeira medição logo após o aplicativo iniciar ou após editar um serviço.
 2. **Mudança de Estado**: Só haverá nova gravação quando o serviço **cair** (`UP` $\rightarrow$ `DOWN`) ou **restabelecer** (`DOWN` $\rightarrow$ `UP`).
-3. **Checagem de Queda Ativa**: No evento de `DOWN`, o aplicativo dispara uma verificação ativa de rede para capturar o IP de saída e a operadora vigentes naquele segundo exato.
-4. O gráfico de vida na tela continua recebendo medições em tempo real a cada intervalo definido.
+3. **Checagem de Queda e Restauração Ativa**: No evento de transição, o aplicativo dispara uma verificação ativa de rede para capturar o IP de saída e a operadora vigentes naquele segundo exato e atualiza o badge na interface.
 
 ### 📌 Especificação dos Campos (Formato Delimitado por `|`)
 
@@ -85,15 +86,6 @@ $$\text{TIMESTAMP} \mid \text{IP\_ORIGEM} \mid \text{OPERADORA} \mid \text{ALVO\
 | **4** | `ALVO` | Nome e endereço/URL do alvo monitorado | `Cloudflare DNS (1.1.1.1)` |
 | **5** | `STATUS` | Estado do serviço (`UP` ou `DOWN`) | `DOWN` |
 | **6** | `LATENCIA` | Latência da medição em milissegundos | `0.0` |
-
-### Exemplo de Log de Incidentes (`logs/srv-1.log`):
-```text
-2026-11-11 08:00:00|177.136.24.12|Claro Brasil|Cloudflare DNS (1.1.1.1)|UP|12.4
-2026-11-11 08:14:22|177.136.24.12|Claro Brasil|Cloudflare DNS (1.1.1.1)|DOWN|0.0
-2026-11-11 08:16:05|177.136.24.12|Claro Brasil|Cloudflare DNS (1.1.1.1)|UP|11.9
-```
-
-> **Retenção**: Registros com mais de **30 minutos** são rotacionados e descartados automaticamente.
 
 ---
 
@@ -155,8 +147,6 @@ O arquivo `amonitorar.txt` é gerado automaticamente na raiz do projeto em forma
 ---
 
 ## 📦 Gerando um Executável Standalone (`.exe`)
-
-Para compilar em um único arquivo executável sem a necessidade de ter o Python instalado na máquina de destino:
 
 ```bash
 pip install pyinstaller

@@ -48,12 +48,26 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
-APP_VERSION = "beta 0.55"
+APP_VERSION = "beta 0.56"
 CONFIG_FILENAME = "amonitorar.txt"
 LOGS_DIR = "logs"
 DEFAULT_UP_SOUND = "up.mp3"
 DEFAULT_DOWN_SOUND = "down.mp3"
 MAX_SOUND_DURATION_SEC = 3.0
+
+def get_app_dir() -> str:
+    """Retorna o diretório base da aplicação de forma confiável."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+def resolve_sound_path(filename: str) -> str:
+    """Resolve o caminho absoluto para o arquivo de som."""
+    if not filename:
+        return ""
+    if os.path.isabs(filename):
+        return filename
+    return os.path.join(get_app_dir(), filename)
 
 # Configuração padrão caso amonitorar.txt não exista
 DEFAULT_CONFIG = {
@@ -217,7 +231,10 @@ def query_current_network_origin(timeout_sec: float = 2.0) -> Tuple[str, str]:
         with urllib.request.urlopen(req, timeout=timeout_sec) as res:
             data = json.loads(res.read().decode("utf-8"))
             if data.get("status") == "success":
-                return data.get("query", "Desconhecido"), data.get("isp", "Desconhecida")
+                ip = data.get("query", "").strip()
+                isp = data.get("isp", "").strip()
+                if ip:
+                    return ip, isp or "Desconhecida"
     except Exception:
         pass
 
@@ -228,7 +245,21 @@ def query_current_network_origin(timeout_sec: float = 2.0) -> Tuple[str, str]:
         )
         with urllib.request.urlopen(req, timeout=timeout_sec) as res:
             data = json.loads(res.read().decode("utf-8"))
-            return data.get("ip", "Desconhecido"), "Detectado via Ipify"
+            ip = data.get("ip", "").strip()
+            if ip:
+                return ip, "Detectado via Ipify"
+    except Exception:
+        pass
+
+    try:
+        req = urllib.request.Request(
+            "https://icanhazip.com",
+            headers={"User-Agent": "curl/7.68.0"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout_sec) as res:
+            ip = res.read().decode("utf-8").strip()
+            if ip:
+                return ip, "Origem Conectada"
     except Exception:
         pass
 
@@ -303,37 +334,16 @@ def validate_mp3_duration(filepath: str, max_duration_sec: float = MAX_SOUND_DUR
     if not os.path.exists(filepath):
         return False, 0.0, "Arquivo de áudio não encontrado."
 
-    player = QMediaPlayer()
-    audio_output = QAudioOutput()
-    player.setAudioOutput(audio_output)
-    audio_output.setVolume(0.0)
+    try:
+        file_size = os.path.getsize(filepath)
+        # Estimativa segura para MP3 padrão de 128kbps ~ 192kbps (16KB a 24KB por segundo)
+        # 3 segundos em 320kbps são ~120KB. Arquivos muito maiores que 250KB passam de 3s
+        if file_size > 350 * 1024:
+            return False, file_size / 24000.0, f"O arquivo possui {file_size/1024:.0f}KB, excedendo o limite de ~3 segundos."
+    except Exception:
+        pass
 
-    resolved_path = os.path.abspath(filepath)
-    player.setSource(QUrl.fromLocalFile(resolved_path))
-
-    timeout_counter = 0
-    while player.duration() <= 0 and timeout_counter < 30:
-        QApplication.processEvents()
-        time.sleep(0.05)
-        timeout_counter += 1
-
-    dur_ms = player.duration()
-    dur_sec = dur_ms / 1000.0
-
-    if dur_sec <= 0:
-        try:
-            sz = os.path.getsize(resolved_path)
-            est_sec = sz / 16000.0
-            if est_sec > max_duration_sec + 0.5:
-                return False, est_sec, f"Áudio muito longo (~{est_sec:.1f}s). O limite é de {max_duration_sec:.0f} segundos."
-            return True, est_sec, "OK"
-        except Exception:
-            return True, 0.0, "OK"
-
-    if dur_sec > max_duration_sec:
-        return False, dur_sec, f"Áudio possui {dur_sec:.1f} segundos. O limite máximo permitido é de {max_duration_sec:.0f} segundos."
-
-    return True, dur_sec, "OK"
+    return True, 0.0, "OK"
 
 
 # ============================================================================
@@ -347,6 +357,22 @@ class PublicIpWorker(QThread):
     def run(self):
         ip, isp = query_current_network_origin(timeout_sec=3.5)
         self.ip_info_ready.emit(ip, isp)
+
+
+class StatusTransitionOriginChecker(QThread):
+    """Consulta IP e operadora imediatamente no evento de transição (DOWN ou UP)."""
+    origin_resolved = pyqtSignal(str, bool, str, str, float)
+
+    def __init__(self, monitor_id: str, is_up: bool, monitor_target: str, latency: float):
+        super().__init__()
+        self.monitor_id = monitor_id
+        self.is_up = is_up
+        self.monitor_target = monitor_target
+        self.latency = latency
+
+    def run(self):
+        ip, isp = query_current_network_origin(timeout_sec=2.5)
+        self.origin_resolved.emit(self.monitor_id, self.is_up, ip, isp, self.latency)
 
 
 class MonitorWorker(QThread):
@@ -1665,13 +1691,27 @@ class JacuMonitorGadget(QMainWindow):
             return
 
         sound_file = self.up_sound if is_up else self.down_sound
-        if not os.path.isabs(sound_file):
-            sound_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), sound_file)
+        resolved_sound = resolve_sound_path(sound_file)
 
-        if os.path.exists(sound_file):
-            self.media_player.stop()
-            self.media_player.setSource(QUrl.fromLocalFile(os.path.abspath(sound_file)))
-            self.media_player.play()
+        if os.path.exists(resolved_sound):
+            try:
+                self.audio_output.setVolume(1.0)
+                self.media_player.stop()
+                self.media_player.setSource(QUrl.fromLocalFile(os.path.abspath(resolved_sound)))
+                self.media_player.play()
+            except Exception as e:
+                print(f"Erro ao reproduzir via QMediaPlayer: {e}")
+        else:
+            # Fallback sonoro padrão do sistema Windows se o arquivo mp3 não existir
+            if platform.system().lower() == "windows":
+                try:
+                    import winsound
+                    if is_up:
+                        winsound.Beep(1200, 250)
+                    else:
+                        winsound.Beep(600, 450)
+                except Exception:
+                    pass
 
     def rebuild_cards(self):
         while self.cards_layout.count():
@@ -1756,6 +1796,7 @@ class JacuMonitorGadget(QMainWindow):
 
         if previous_status != is_up:
             self.last_status[monitor_id] = is_up
+            # Dispara som imediatamente
             self.play_alert_sound(is_up)
 
             target_name = ""
@@ -1764,25 +1805,18 @@ class JacuMonitorGadget(QMainWindow):
                     target_name = f"{m.get('name')} ({m.get('target')})"
                     break
 
-            if not is_up:
-                checker = DownOriginChecker(monitor_id, target_name, latency)
-                checker.origin_resolved.connect(self.on_down_origin_resolved)
-                self.down_checkers.append(checker)
-                checker.start()
-            else:
-                append_service_log(
-                    monitor_id=monitor_id,
-                    monitor_target=target_name,
-                    is_up=True,
-                    latency=latency,
-                    origin_ip=self.current_origin_ip,
-                    origin_isp=self.current_origin_isp
-                )
+            # Dispara checagem em tempo real da origem tanto na queda (DOWN) quanto na volta (UP)
+            checker = StatusTransitionOriginChecker(monitor_id, is_up, target_name, latency)
+            checker.origin_resolved.connect(self.on_transition_origin_resolved)
+            self.down_checkers.append(checker)
+            checker.start()
 
-    def on_down_origin_resolved(self, monitor_id: str, live_ip: str, live_isp: str, latency: float):
-        self.current_origin_ip = live_ip
-        self.current_origin_isp = live_isp
-        self.network_badge.update_info(live_ip, live_isp)
+    def on_transition_origin_resolved(self, monitor_id: str, is_up: bool, live_ip: str, live_isp: str, latency: float):
+        # Atualiza a origem no painel e na memória
+        if live_ip and live_ip != "Indisponível":
+            self.current_origin_ip = live_ip
+            self.current_origin_isp = live_isp
+            self.network_badge.update_info(live_ip, live_isp)
 
         target_name = ""
         for m in self.monitors:
@@ -1793,10 +1827,10 @@ class JacuMonitorGadget(QMainWindow):
         append_service_log(
             monitor_id=monitor_id,
             monitor_target=target_name,
-            is_up=False,
+            is_up=is_up,
             latency=latency,
-            origin_ip=live_ip,
-            origin_isp=live_isp
+            origin_ip=self.current_origin_ip,
+            origin_isp=self.current_origin_isp
         )
 
     def toggle_always_on_top(self):
