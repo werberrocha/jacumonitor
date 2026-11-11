@@ -2,18 +2,22 @@
 jacu.ia monitor - Windows 11 Gadget / HUD Monitoring Tool
 ---------------------------------------------------------
 Author: jacu.ia
+Version: beta 0.5
 Description:
     Lightweight, modern desktop gadget for Windows 11 built with PyQt6.
     Monitors servers and network services (ICMP Ping, TCP Ports, HTTP/HTTPS endpoints).
     Features:
       - Always-On-Top toggleable floating gadget mode.
+      - Audio alert toggle (mute / unmute) in header for UP and DOWN events.
+      - Custom UP/DOWN MP3 sound selection with max 3-second duration validation.
+      - Real-time IP & ISP detection before registering DOWN event logs.
       - Public IP & ISP (Operadora) display with 5-minute auto-refresh & double-click force update.
       - Frameless, translucent dark mode UI with Windows 11 aesthetic.
       - Dynamic JSON-based configuration stored in `amonitorar.txt`.
-      - Real-time LED indicator & sparkline heartbeat latency graph.
+      - Real-time LED indicator & sparkline heartbeat latency graph with timestamps.
       - Non-blocking background worker threads with customizable interval per target.
-      - Event-based compact 30-minute rolling logs (only on initial state and status change).
-      - Integrated visual manager to add, edit, test, and remove monitors.
+      - Event-based compact 30-minute rolling logs (initial state and status transitions).
+      - Integrated visual manager to add, edit, test, reorder, and remove monitors.
 """
 
 import sys
@@ -27,10 +31,10 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QPoint, QRectF, QTimer, QEvent
+    Qt, QThread, pyqtSignal, QPoint, QRectF, QTimer, QEvent, QUrl
 )
 from PyQt6.QtGui import (
     QColor, QPainter, QPen, QBrush, QPainterPath, QFont, QMouseEvent
@@ -39,15 +43,24 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QScrollArea, QDialog,
     QLineEdit, QComboBox, QSpinBox, QMessageBox, QFrame,
-    QGraphicsDropShadowEffect, QSlider, QSizeGrip, QToolTip
+    QGraphicsDropShadowEffect, QSlider, QSizeGrip, QToolTip,
+    QFileDialog
 )
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
+APP_VERSION = "beta 0.5"
 CONFIG_FILENAME = "amonitorar.txt"
 LOGS_DIR = "logs"
+DEFAULT_UP_SOUND = "up.mp3"
+DEFAULT_DOWN_SOUND = "down.mp3"
+MAX_SOUND_DURATION_SEC = 3.0
 
 # Default configuration template if file does not exist
 DEFAULT_CONFIG = {
     "opacity": 92,
+    "sound_enabled": True,
+    "up_sound": DEFAULT_UP_SOUND,
+    "down_sound": DEFAULT_DOWN_SOUND,
     "window": {
         "x": 100,
         "y": 100,
@@ -104,12 +117,20 @@ def load_config() -> Dict[str, Any]:
         with open(CONFIG_FILENAME, "r", encoding="utf-8") as f:
             data = json.load(f)
             if isinstance(data, list):
-                return {"opacity": 92, "window": DEFAULT_CONFIG["window"], "monitors": data}
+                res = dict(DEFAULT_CONFIG)
+                res["monitors"] = data
+                return res
             if isinstance(data, dict):
                 if "monitors" not in data:
                     data["monitors"] = []
                 if "opacity" not in data:
                     data["opacity"] = 92
+                if "sound_enabled" not in data:
+                    data["sound_enabled"] = True
+                if "up_sound" not in data:
+                    data["up_sound"] = DEFAULT_UP_SOUND
+                if "down_sound" not in data:
+                    data["down_sound"] = DEFAULT_DOWN_SOUND
                 if "window" not in data or not isinstance(data["window"], dict):
                     data["window"] = dict(DEFAULT_CONFIG["window"])
                 return data
@@ -150,8 +171,7 @@ def append_service_log(monitor_id: str, monitor_target: str, is_up: bool, latenc
         clean_target = monitor_target.replace("|", "/")
         clean_isp = origin_isp.replace("|", "/")
         clean_ip = origin_ip.replace("|", "/")
-        
-        # Format: TIMESTAMP|ORIGIN_IP|ORIGIN_ISP|TARGET|STATUS|LATENCY_MS
+
         new_entry = f"{now.strftime('%Y-%m-%d %H:%M:%S')}|{clean_ip}|{clean_isp}|{clean_target}|{status_str}|{latency:.1f}\n"
 
         cutoff_time = now - timedelta(minutes=30)
@@ -187,7 +207,35 @@ def append_service_log(monitor_id: str, monitor_target: str, is_up: bool, latenc
 #  Network Verification Logic
 # ============================================================================
 
-def check_ping(host: str, timeout_sec: float = 2.0) -> (bool, float):
+def query_current_network_origin(timeout_sec: float = 2.0) -> Tuple[str, str]:
+    """Queries current public IP and ISP synchronously with short timeout."""
+    try:
+        req = urllib.request.Request(
+            "http://ip-api.com/json/?fields=query,isp,status",
+            headers={"User-Agent": "jacu.ia-monitor/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout_sec) as res:
+            data = json.loads(res.read().decode("utf-8"))
+            if data.get("status") == "success":
+                return data.get("query", "Desconhecido"), data.get("isp", "Desconhecida")
+    except Exception:
+        pass
+
+    try:
+        req = urllib.request.Request(
+            "https://api.ipify.org?format=json",
+            headers={"User-Agent": "jacu.ia-monitor/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout_sec) as res:
+            data = json.loads(res.read().decode("utf-8"))
+            return data.get("ip", "Desconhecido"), "Detectado via Ipify"
+    except Exception:
+        pass
+
+    return "Indisponível", "Sem rota / Falha de Conexão"
+
+
+def check_ping(host: str, timeout_sec: float = 2.0) -> Tuple[bool, float]:
     """Executes an ICMP echo ping and calculates latency in ms."""
     param = "-n" if platform.system().lower() == "windows" else "-c"
     timeout_param = "-w" if platform.system().lower() == "windows" else "-W"
@@ -210,7 +258,7 @@ def check_ping(host: str, timeout_sec: float = 2.0) -> (bool, float):
         return (False, 0.0)
 
 
-def check_tcp(host: str, port: int, timeout_sec: float = 2.0) -> (bool, float):
+def check_tcp(host: str, port: int, timeout_sec: float = 2.0) -> Tuple[bool, float]:
     """Checks raw TCP socket connection (e.g. SSH, MySQL, Postgres, Telnet)."""
     start_time = time.time()
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -224,7 +272,7 @@ def check_tcp(host: str, port: int, timeout_sec: float = 2.0) -> (bool, float):
         return (False, 0.0)
 
 
-def check_http(url: str, timeout_sec: float = 3.0) -> (bool, float):
+def check_http(url: str, timeout_sec: float = 3.0) -> Tuple[bool, float]:
     """Checks HTTP/HTTPS endpoint availability and response speed."""
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "http://" + url
@@ -247,6 +295,51 @@ def check_http(url: str, timeout_sec: float = 3.0) -> (bool, float):
 
 
 # ============================================================================
+#  Audio Duration Validator
+# ============================================================================
+
+def validate_mp3_duration(filepath: str, max_duration_sec: float = MAX_SOUND_DURATION_SEC) -> Tuple[bool, float, str]:
+    """
+    Validates that the given MP3 file exists and does not exceed the allowed duration.
+    Uses PyQt6 MediaPlayer synchronously with event loops for accurate duration check.
+    """
+    if not os.path.exists(filepath):
+        return False, 0.0, "Arquivo de áudio não encontrado."
+
+    player = QMediaPlayer()
+    audio_output = QAudioOutput()
+    player.setAudioOutput(audio_output)
+    audio_output.setVolume(0.0)
+
+    resolved_path = os.path.abspath(filepath)
+    player.setSource(QUrl.fromLocalFile(resolved_path))
+
+    timeout_counter = 0
+    while player.duration() <= 0 and timeout_counter < 30:
+        QApplication.processEvents()
+        time.sleep(0.05)
+        timeout_counter += 1
+
+    dur_ms = player.duration()
+    dur_sec = dur_ms / 1000.0
+
+    if dur_sec <= 0:
+        try:
+            sz = os.path.getsize(resolved_path)
+            est_sec = sz / 16000.0
+            if est_sec > max_duration_sec + 0.5:
+                return False, est_sec, f"Áudio muito longo (~{est_sec:.1f}s). O limite é de {max_duration_sec:.0f} segundos."
+            return True, est_sec, "OK"
+        except Exception:
+            return True, 0.0, "OK"
+
+    if dur_sec > max_duration_sec:
+        return False, dur_sec, f"Áudio possui {dur_sec:.1f} segundos. O limite máximo permitido é de {max_duration_sec:.0f} segundos."
+
+    return True, dur_sec, "OK"
+
+
+# ============================================================================
 #  Public IP & ISP Discovery Worker
 # ============================================================================
 
@@ -255,38 +348,7 @@ class PublicIpWorker(QThread):
     ip_info_ready = pyqtSignal(str, str)
 
     def run(self):
-        ip = "Desconhecido"
-        isp = "Sem conexão"
-
-        try:
-            req = urllib.request.Request(
-                "http://ip-api.com/json/?fields=query,isp,status",
-                headers={"User-Agent": "jacu.ia-monitor/1.0"}
-            )
-            with urllib.request.urlopen(req, timeout=4.0) as res:
-                data = json.loads(res.read().decode("utf-8"))
-                if data.get("status") == "success":
-                    ip = data.get("query", "Desconhecido")
-                    isp = data.get("isp", "Desconhecida")
-                    self.ip_info_ready.emit(ip, isp)
-                    return
-        except Exception:
-            pass
-
-        try:
-            req = urllib.request.Request(
-                "https://api.ipify.org?format=json",
-                headers={"User-Agent": "jacu.ia-monitor/1.0"}
-            )
-            with urllib.request.urlopen(req, timeout=4.0) as res:
-                data = json.loads(res.read().decode("utf-8"))
-                ip = data.get("ip", "Desconhecido")
-                isp = "Detectado via Ipify"
-                self.ip_info_ready.emit(ip, isp)
-                return
-        except Exception:
-            pass
-
+        ip, isp = query_current_network_origin(timeout_sec=3.5)
         self.ip_info_ready.emit(ip, isp)
 
 
@@ -331,6 +393,25 @@ class MonitorWorker(QThread):
 
 
 # ============================================================================
+#  Down-Event Origin Checker Thread
+# ============================================================================
+
+class DownOriginChecker(QThread):
+    """Asynchronously confirms network origin route exactly when a DOWN occurs."""
+    origin_resolved = pyqtSignal(str, str, str, float)
+
+    def __init__(self, monitor_id: str, monitor_target: str, latency: float):
+        super().__init__()
+        self.monitor_id = monitor_id
+        self.monitor_target = monitor_target
+        self.latency = latency
+
+    def run(self):
+        ip, isp = query_current_network_origin(timeout_sec=2.5)
+        self.origin_resolved.emit(self.monitor_id, ip, isp, self.latency)
+
+
+# ============================================================================
 #  Custom UI Components: Sparkline Latency Graph & LED
 # ============================================================================
 
@@ -339,8 +420,8 @@ class SparklineWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.history: List[tuple[float, str]] = []
-        self.points_cache: List[tuple[float, float, float, str]] = []
+        self.history: List[Tuple[float, str]] = []
+        self.points_cache: List[Tuple[float, float, float, str]] = []
         self.max_points = 24
         self.setFixedHeight(36)
         self.setMouseTracking(True)
@@ -825,19 +906,27 @@ class EditServiceDialog(QDialog):
 
 
 # ============================================================================
-#  Service Manager Modal Dialog
+#  Service & Audio Manager Modal Dialog
 # ============================================================================
 
 class ServiceManagerDialog(QDialog):
-    """Dialog allowing users to add, reorder, adjust opacity, and remove monitored targets."""
+    """Dialog allowing users to manage audio alerts, add, reorder, adjust opacity, and remove monitors."""
 
-    def __init__(self, monitors: List[Dict[str, Any]], current_opacity: int, parent=None):
+    def __init__(self, monitors: List[Dict[str, Any]], current_opacity: int,
+                 up_sound: str, down_sound: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Configurações & Painel - jacu.ia monitor")
-        self.resize(560, 560)
+        self.resize(600, 680)
         self.setModal(True)
         self.monitors = [dict(m) for m in monitors]
         self.opacity_val = current_opacity
+        self.up_sound = up_sound
+        self.down_sound = down_sound
+
+        self.preview_player = QMediaPlayer()
+        self.preview_audio_output = QAudioOutput()
+        self.preview_player.setAudioOutput(self.preview_audio_output)
+        self.preview_audio_output.setVolume(1.0)
 
         self.setStyleSheet("""
             QDialog {
@@ -898,7 +987,7 @@ class ServiceManagerDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
 
         # ----------------- Transparência do Gadget -----------------
         op_box = QHBoxLayout()
@@ -917,6 +1006,55 @@ class ServiceManagerDialog(QDialog):
         self.lbl_opacity_val.setStyleSheet("color: #38BDF8; font-weight: bold;")
         op_box.addWidget(self.lbl_opacity_val)
         layout.addLayout(op_box)
+
+        # ----------------- Configuração de Áudios MP3 -----------------
+        audio_group = QFrame()
+        audio_group.setStyleSheet("background-color: #162032; border: 1px solid #1E293B; border-radius: 6px; padding: 6px;")
+        audio_layout = QVBoxLayout(audio_group)
+        audio_layout.setContentsMargins(8, 8, 8, 8)
+        audio_layout.setSpacing(6)
+
+        lbl_audio_title = QLabel("🔔 Alertas Sonoros (MP3 - Máximo 3 segundos):")
+        lbl_audio_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #F59E0B;")
+        audio_layout.addWidget(lbl_audio_title)
+
+        # UP Sound Row
+        row_up = QHBoxLayout()
+        row_up.addWidget(QLabel("Som UP:"))
+        self.txt_up_sound = QLineEdit(self.up_sound)
+        self.txt_up_sound.setReadOnly(True)
+        row_up.addWidget(self.txt_up_sound, 1)
+
+        btn_browse_up = QPushButton("Procurar…")
+        btn_browse_up.setStyleSheet("background-color: #334155; font-size: 11px;")
+        btn_browse_up.clicked.connect(self.browse_up_sound)
+        row_up.addWidget(btn_browse_up)
+
+        btn_play_up = QPushButton("▶ Testar")
+        btn_play_up.setStyleSheet("background-color: #059669; font-size: 11px;")
+        btn_play_up.clicked.connect(lambda: self.preview_sound(self.txt_up_sound.text()))
+        row_up.addWidget(btn_play_up)
+        audio_layout.addLayout(row_up)
+
+        # DOWN Sound Row
+        row_down = QHBoxLayout()
+        row_down.addWidget(QLabel("Som DOWN:"))
+        self.txt_down_sound = QLineEdit(self.down_sound)
+        self.txt_down_sound.setReadOnly(True)
+        row_down.addWidget(self.txt_down_sound, 1)
+
+        btn_browse_down = QPushButton("Procurar…")
+        btn_browse_down.setStyleSheet("background-color: #334155; font-size: 11px;")
+        btn_browse_down.clicked.connect(self.browse_down_sound)
+        row_down.addWidget(btn_browse_down)
+
+        btn_play_down = QPushButton("▶ Testar")
+        btn_play_down.setStyleSheet("background-color: #DC2626; font-size: 11px;")
+        btn_play_down.clicked.connect(lambda: self.preview_sound(self.txt_down_sound.text()))
+        row_down.addWidget(btn_play_down)
+        audio_layout.addLayout(row_down)
+
+        layout.addWidget(audio_group)
 
         div1 = QFrame()
         div1.setFrameShape(QFrame.Shape.HLine)
@@ -997,12 +1135,39 @@ class ServiceManagerDialog(QDialog):
 
         self.btn_close = QPushButton("Salvar e Aplicar")
         self.btn_close.setStyleSheet("background-color: #10B981; padding: 8px 18px;")
-        self.btn_close.clicked.connect(self.accept)
+        self.btn_close.clicked.connect(self.save_and_accept)
         btn_box.addWidget(self.btn_close)
 
         layout.addLayout(btn_box)
 
         self.refresh_list()
+
+    def preview_sound(self, sound_path: str):
+        if not sound_path or not os.path.exists(sound_path):
+            QMessageBox.warning(self, "Aviso", f"Arquivo de áudio não encontrado:\n{sound_path}")
+            return
+        abs_path = os.path.abspath(sound_path)
+        self.preview_player.stop()
+        self.preview_player.setSource(QUrl.fromLocalFile(abs_path))
+        self.preview_player.play()
+
+    def browse_up_sound(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Selecionar Som para UP", "", "Arquivos MP3 (*.mp3)")
+        if file_path:
+            ok, dur, err_msg = validate_mp3_duration(file_path, MAX_SOUND_DURATION_SEC)
+            if not ok:
+                QMessageBox.critical(self, "Áudio Inválido", f"{err_msg}\nPor favor selecione um arquivo de até 3 segundos.")
+                return
+            self.txt_up_sound.setText(file_path)
+
+    def browse_down_sound(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Selecionar Som para DOWN", "", "Arquivos MP3 (*.mp3)")
+        if file_path:
+            ok, dur, err_msg = validate_mp3_duration(file_path, MAX_SOUND_DURATION_SEC)
+            if not ok:
+                QMessageBox.critical(self, "Áudio Inválido", f"{err_msg}\nPor favor selecione um arquivo de até 3 segundos.")
+                return
+            self.txt_down_sound.setText(file_path)
 
     def on_opacity_change(self, val: int):
         self.opacity_val = val
@@ -1150,11 +1315,7 @@ class ServiceManagerDialog(QDialog):
         interval = self.spn_interval.value()
 
         if not name or not target:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Campos Obrigatórios")
-            msg.setText("Por favor, preencha o Nome e o Endereço IP / URL.")
-            msg.setIcon(QMessageBox.Icon.Warning)
-            msg.exec()
+            QMessageBox.warning(self, "Campos Obrigatórios", "Por favor, preencha o Nome e o Endereço IP / URL.")
             return
 
         new_item = {
@@ -1176,11 +1337,20 @@ class ServiceManagerDialog(QDialog):
             self.monitors.pop(index)
             self.refresh_list()
 
+    def save_and_accept(self):
+        self.up_sound = self.txt_up_sound.text().strip()
+        self.down_sound = self.txt_down_sound.text().strip()
+        self.preview_player.stop()
+        self.accept()
+
     def get_updated_monitors(self) -> List[Dict[str, Any]]:
         return self.monitors
 
     def get_updated_opacity(self) -> int:
         return self.opacity_val
+
+    def get_updated_sounds(self) -> Tuple[str, str]:
+        return self.up_sound, self.down_sound
 
 
 # ============================================================================
@@ -1195,9 +1365,14 @@ class JacuMonitorGadget(QMainWindow):
         self.config = load_config()
         self.monitors: List[Dict[str, Any]] = self.config.get("monitors", [])
         self.opacity_val: int = int(self.config.get("opacity", 92))
+        self.sound_enabled: bool = bool(self.config.get("sound_enabled", True))
+        self.up_sound: str = str(self.config.get("up_sound", DEFAULT_UP_SOUND))
+        self.down_sound: str = str(self.config.get("down_sound", DEFAULT_DOWN_SOUND))
         self.window_geom = self.config.get("window", {"x": 100, "y": 100, "width": 350, "height": 500})
+
         self.workers: Dict[str, MonitorWorker] = {}
         self.cards: Dict[str, MonitorCard] = {}
+        self.down_checkers: List[DownOriginChecker] = []
         self.is_always_on_top = True
         self.drag_position = QPoint()
 
@@ -1208,6 +1383,12 @@ class JacuMonitorGadget(QMainWindow):
         # Tracks last known status per monitor_id (None: uninitialized, True: UP, False: DOWN)
         self.last_status: Dict[str, bool] = {}
 
+        # Audio player setup
+        self.audio_output = QAudioOutput(self)
+        self.audio_output.setVolume(1.0)
+        self.media_player = QMediaPlayer(self)
+        self.media_player.setAudioOutput(self.audio_output)
+
         self.ip_worker = None
         self.ip_timer = QTimer(self)
 
@@ -1217,7 +1398,7 @@ class JacuMonitorGadget(QMainWindow):
         self.start_monitoring()
 
     def init_window_properties(self):
-        self.setWindowTitle("jacu.ia monitor")
+        self.setWindowTitle(f"jacu.ia monitor ({APP_VERSION})")
         self.setMinimumSize(300, 220)
 
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -1261,6 +1442,9 @@ class JacuMonitorGadget(QMainWindow):
             "width": sz.width(),
             "height": sz.height()
         }
+        self.config["sound_enabled"] = self.sound_enabled
+        self.config["up_sound"] = self.up_sound
+        self.config["down_sound"] = self.down_sound
         save_config(self.config)
 
     def update_window_flags(self):
@@ -1334,7 +1518,7 @@ class JacuMonitorGadget(QMainWindow):
         lbl_sub.setStyleSheet("font-size: 13px; font-weight: 400; color: #94A3B8;")
         title_box.addWidget(lbl_sub)
 
-        lbl_version = QLabel("beta 0.1")
+        lbl_version = QLabel(APP_VERSION)
         lbl_version.setStyleSheet("""
             background-color: rgba(245, 158, 11, 0.18);
             color: #FBBF24;
@@ -1348,6 +1532,14 @@ class JacuMonitorGadget(QMainWindow):
 
         header.addLayout(title_box)
         header.addStretch()
+
+        # Audio mute / unmute button
+        self.btn_audio = QPushButton("🔊" if self.sound_enabled else "🔇")
+        self.btn_audio.setToolTip("Ativar / Desativar Alertas Sonoros")
+        self.btn_audio.setFixedSize(26, 26)
+        self.btn_audio.setStyleSheet(self._get_audio_btn_style(self.sound_enabled))
+        self.btn_audio.clicked.connect(self.toggle_sound)
+        header.addWidget(self.btn_audio)
 
         self.btn_pin = QPushButton("📌")
         self.btn_pin.setToolTip("Fixar sobre outros programas (Always on Top)")
@@ -1443,6 +1635,33 @@ class JacuMonitorGadget(QMainWindow):
         self.current_origin_isp = isp
         self.network_badge.update_info(ip, isp)
 
+    def _get_audio_btn_style(self, enabled: bool) -> str:
+        if enabled:
+            return """
+                QPushButton {
+                    background-color: rgba(16, 185, 129, 0.20);
+                    color: #34D399;
+                    border-radius: 5px;
+                    font-size: 12px;
+                    border: 1px solid rgba(16, 185, 129, 0.40);
+                }
+                QPushButton:hover {
+                    background-color: rgba(16, 185, 129, 0.35);
+                }
+            """
+        return """
+            QPushButton {
+                background-color: rgba(239, 68, 68, 0.20);
+                color: #F87171;
+                border-radius: 5px;
+                font-size: 12px;
+                border: 1px solid rgba(239, 68, 68, 0.40);
+            }
+            QPushButton:hover {
+                background-color: rgba(239, 68, 68, 0.35);
+            }
+        """
+
     def _get_pin_btn_style(self, active: bool) -> str:
         if active:
             return """
@@ -1467,6 +1686,26 @@ class JacuMonitorGadget(QMainWindow):
                 color: #CBD5E1;
             }
         """
+
+    def toggle_sound(self):
+        self.sound_enabled = not self.sound_enabled
+        self.btn_audio.setText("🔊" if self.sound_enabled else "🔇")
+        self.btn_audio.setStyleSheet(self._get_audio_btn_style(self.sound_enabled))
+        self.config["sound_enabled"] = self.sound_enabled
+        save_config(self.config)
+
+    def play_alert_sound(self, is_up: bool):
+        if not self.sound_enabled:
+            return
+
+        sound_file = self.up_sound if is_up else self.down_sound
+        if not os.path.isabs(sound_file):
+            sound_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), sound_file)
+
+        if os.path.exists(sound_file):
+            self.media_player.stop()
+            self.media_player.setSource(QUrl.fromLocalFile(os.path.abspath(sound_file)))
+            self.media_player.play()
 
     def rebuild_cards(self):
         while self.cards_layout.count():
@@ -1499,7 +1738,6 @@ class JacuMonitorGadget(QMainWindow):
                     self.monitors[idx] = diag.get_data()
                     self.config["monitors"] = self.monitors
                     save_config(self.config)
-                    # Reset tracked state for this item
                     if monitor_id in self.last_status:
                         del self.last_status[monitor_id]
                     self.rebuild_cards()
@@ -1524,14 +1762,18 @@ class JacuMonitorGadget(QMainWindow):
         if self.ip_worker and self.ip_worker.isRunning():
             self.ip_worker.wait(1000)
 
+        for chk in self.down_checkers:
+            if chk.isRunning():
+                chk.wait(500)
+        self.down_checkers.clear()
+
     def on_metric_received(self, monitor_id: str, is_up: bool, latency: float):
-        # Always update UI and real-time sparkline graph
         if monitor_id in self.cards:
             self.cards[monitor_id].update_status(is_up, latency)
 
-        # Log only on initial collection OR when there is an actual change of status
         previous_status = self.last_status.get(monitor_id, None)
-        if previous_status is None or previous_status != is_up:
+
+        if previous_status is None:
             self.last_status[monitor_id] = is_up
             for m in self.monitors:
                 if m.get("id") == monitor_id:
@@ -1544,6 +1786,52 @@ class JacuMonitorGadget(QMainWindow):
                         origin_isp=self.current_origin_isp
                     )
                     break
+            return
+
+        if previous_status != is_up:
+            self.last_status[monitor_id] = is_up
+            self.play_alert_sound(is_up)
+
+            target_name = ""
+            for m in self.monitors:
+                if m.get("id") == monitor_id:
+                    target_name = f"{m.get('name')} ({m.get('target')})"
+                    break
+
+            if not is_up:
+                checker = DownOriginChecker(monitor_id, target_name, latency)
+                checker.origin_resolved.connect(self.on_down_origin_resolved)
+                self.down_checkers.append(checker)
+                checker.start()
+            else:
+                append_service_log(
+                    monitor_id=monitor_id,
+                    monitor_target=target_name,
+                    is_up=True,
+                    latency=latency,
+                    origin_ip=self.current_origin_ip,
+                    origin_isp=self.current_origin_isp
+                )
+
+    def on_down_origin_resolved(self, monitor_id: str, live_ip: str, live_isp: str, latency: float):
+        self.current_origin_ip = live_ip
+        self.current_origin_isp = live_isp
+        self.network_badge.update_info(live_ip, live_isp)
+
+        target_name = ""
+        for m in self.monitors:
+            if m.get("id") == monitor_id:
+                target_name = f"{m.get('name')} ({m.get('target')})"
+                break
+
+        append_service_log(
+            monitor_id=monitor_id,
+            monitor_target=target_name,
+            is_up=False,
+            latency=latency,
+            origin_ip=live_ip,
+            origin_isp=live_isp
+        )
 
     def toggle_always_on_top(self):
         self.is_always_on_top = not self.is_always_on_top
@@ -1551,19 +1839,26 @@ class JacuMonitorGadget(QMainWindow):
         self.update_window_flags()
 
     def open_manager(self):
-        dialog = ServiceManagerDialog(self.monitors, self.opacity_val, self)
+        dialog = ServiceManagerDialog(
+            monitors=self.monitors,
+            current_opacity=self.opacity_val,
+            up_sound=self.up_sound,
+            down_sound=self.down_sound,
+            parent=self
+        )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.monitors = dialog.get_updated_monitors()
             self.opacity_val = dialog.get_updated_opacity()
+            self.up_sound, self.down_sound = dialog.get_updated_sounds()
             self.setWindowOpacity(self.opacity_val / 100.0)
 
             self.config["monitors"] = self.monitors
             self.config["opacity"] = self.opacity_val
+            self.config["up_sound"] = self.up_sound
+            self.config["down_sound"] = self.down_sound
             save_config(self.config)
 
-            # Clear state cache so new/reordered items log their initial state correctly
             self.last_status.clear()
-
             self.rebuild_cards()
             self.start_monitoring()
         else:
@@ -1619,3 +1914,173 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
+```markdown:README.md:README.md
+# jacu.ia monitor (beta 0.5)
+
+> Gadget / HUD moderno e ultraleve para Windows 11 desenvolvido em Python (PyQt6) para monitoramento em tempo real de servidores, portas e endpoints.
+
+---
+
+## ⚡ Principais Recursos
+
+- **Modo Gadget / HUD Always-On-Top**: Pode ficar flutuando e fixado sobre qualquer janela de jogos, IDEs ou navegadores no Windows 11.
+- **Alertas Sonoros com MP3 (UP & DOWN)**:
+  - Toca arquivos `.mp3` configuráveis ao ocorrer transição de status (`up.mp3` e `down.mp3` por padrão).
+  - **Validação de Duração**: O sistema valida e aceita apenas arquivos de áudio de no **máximo 3 segundos**.
+  - **Botão Mute/Unmute no Cabeçalho**: Ative ou silencie os alertas sonoros diretamente no topo da janela com o botão `🔊` / `🔇`.
+  - Configuração visual com botão de teste (preview) e seleção de arquivo no painel `⚙`.
+- **Checagem de Origem em Tempo Real na Queda**:
+  - Quando um evento de queda (**DOWN**) é detectado, o sistema executa uma verificação imediata de IP e Operadora para registrar a rota real no exato momento da indisponibilidade.
+- **Detecção de IP Público & Operadora**: Mostra seu endereço de IP de origem e provedor/ISP em um badge no topo do painel. Atualizado automaticamente a cada **5 minutos** ou forçado com **duplo clique**.
+- **Transparência / Opacidade Ajustável**: Controle o nível de transparência da janela (de 20% a 100%) em tempo real.
+- **Gráfico de Vida (Sparkline) com Tooltip**:
+  - Pontos sutis e elegantes que desenham o histórico de latência contínuo.
+  - Ao passar o mouse por cima de qualquer ponto, exibe um hint em tempo real com **hora, minuto e segundo (`HH:MM:SS`)**, status e latência em ms.
+  - Linha tracejada vermelha no rodapé indicando perdas de pacotes ou quedas.
+- **Logs Orientados a Eventos (Status Inicial e Mudança de Estado)**:
+  - Não grava medições repetitivas a cada ciclo de polling, evitando escrita desnecessária em disco e poluição.
+  - Grava **apenas o status inicial** na primeira verificação e sempre que houver **mudança de estado** (`UP` $\rightarrow$ `DOWN` ou `DOWN` $\rightarrow$ `UP`).
+  - Formato compacto delimitado por `|` com retenção estrita dos **últimos 30 minutos**.
+- **Indicador LED Dinâmico**: LED luminoso em verde esmeralda (serviço OK) ou vermelho (serviço alarmado/fora do ar).
+- **Tipos de Monitoramento Suportados**:
+  - **PING (ICMP)**: Medição contínua de latência e perda.
+  - **TCP (Portas)**: Conexões diretas de socket (SSH 22, Telnet 23, MySQL 3306, PostgreSQL 5432, Redis 6379, etc.).
+  - **HTTP / HTTPS**: Status code e tempo de resposta de URLs e APIs.
+- **Gerenciamento em Tempo Real**:
+  - Reordene seus serviços com as setas `▲` e `▼`.
+  - Edite qualquer serviço com **duplo clique direto no card** ou através da tela de configurações (`⚙`).
+  - Salva automaticamente tamanho da janela, posição, sons e configurações no arquivo `amonitorar.txt`.
+
+---
+
+## 🚀 Como Executar
+
+### Pré-requisitos
+- **Windows 10 ou 11**
+- **Python 3.10+** instalado e adicionado ao `PATH` do sistema
+
+### 1. Clonar o repositório
+```bash
+git clone https://github.com/seu-usuario/jacu-ia-monitor.git
+cd jacu-ia-monitor
+```
+
+### 2. Instalar dependências
+```bash
+pip install PyQt6
+```
+
+### 3. Rodar o aplicativo
+```bash
+python jacu_monitor.py
+```
+
+> **Dica**: Certifique-se de que os arquivos `up.mp3` e `down.mp3` (com duração de até 3 segundos cada) estejam na pasta do executável para ouvir os alertas sonoros.
+
+---
+
+## 📁 Estrutura de Logs Otimizada (`logs/`)
+
+Para cada serviço cadastrado, um arquivo de log individual é mantido no diretório `logs/<id_servico>.log`.
+
+### 📌 Política de Registro por Mudança de Status
+Para maximizar a precisão e economizar disco:
+1. **Status Inicial**: Gravado na primeira medição logo após o aplicativo iniciar ou após editar um serviço.
+2. **Mudança de Estado**: Só haverá nova gravação quando o serviço **cair** (`UP` $\rightarrow$ `DOWN`) ou **restabelecer** (`DOWN` $\rightarrow$ `UP`).
+3. **Checagem de Queda Ativa**: No evento de `DOWN`, o aplicativo dispara uma verificação ativa de rede para capturar o IP de saída e a operadora vigentes naquele segundo exato.
+4. O gráfico de vida na tela continua recebendo medições em tempo real a cada intervalo definido.
+
+### 📌 Especificação dos Campos (Formato Delimitado por `|`)
+
+$$\text{TIMESTAMP} \mid \text{IP\_ORIGEM} \mid \text{OPERADORA} \mid \text{ALVO\_MONITORADO} \mid \text{STATUS} \mid \text{LATENCIA\_MS}$$
+
+| Posição | Campo | Descrição | Exemplo |
+| :--- | :--- | :--- | :--- |
+| **1** | `TIMESTAMP` | Data e hora exata da transição (`YYYY-MM-DD HH:MM:SS`) | `2026-11-11 08:52:10` |
+| **2** | `IP_ORIGEM` | Endereço IP público apurado no instante do evento | `177.136.24.12` |
+| **3** | `OPERADORA` | Nome do provedor/ISP da rota no momento da transição | `Claro Brasil` |
+| **4** | `ALVO` | Nome e endereço/URL do alvo monitorado | `Cloudflare DNS (1.1.1.1)` |
+| **5** | `STATUS` | Estado do serviço (`UP` ou `DOWN`) | `DOWN` |
+| **6** | `LATENCIA` | Latência da medição em milissegundos | `0.0` |
+
+### Exemplo de Log de Incidentes (`logs/srv-1.log`):
+```text
+2026-11-11 08:00:00|177.136.24.12|Claro Brasil|Cloudflare DNS (1.1.1.1)|UP|12.4
+2026-11-11 08:14:22|177.136.24.12|Claro Brasil|Cloudflare DNS (1.1.1.1)|DOWN|0.0
+2026-11-11 08:16:05|177.136.24.12|Claro Brasil|Cloudflare DNS (1.1.1.1)|UP|11.9
+```
+
+> **Retenção**: Registros com mais de **30 minutos** são rotacionados e descartados automaticamente.
+
+---
+
+## ⚙️ Arquivo de Configuração (`amonitorar.txt`)
+
+O arquivo `amonitorar.txt` é gerado automaticamente na raiz do projeto em formato JSON:
+
+```json
+{
+    "opacity": 92,
+    "sound_enabled": true,
+    "up_sound": "up.mp3",
+    "down_sound": "down.mp3",
+    "window": {
+        "x": 100,
+        "y": 100,
+        "width": 350,
+        "height": 500
+    },
+    "monitors": [
+        {
+            "id": "srv-1",
+            "name": "Cloudflare DNS",
+            "type": "PING",
+            "target": "1.1.1.1",
+            "port": 0,
+            "interval": 5
+        },
+        {
+            "id": "srv-2",
+            "name": "SSH Gateway",
+            "type": "TCP",
+            "target": "meuhost.com.br",
+            "port": 22,
+            "interval": 10
+        }
+    ]
+}
+```
+
+---
+
+## 🖱️ Atalhos e Interações
+
+| Ação | Como Executar |
+| :--- | :--- |
+| **Mover a Janela** | Clique e arraste pelo topo da barra de título |
+| **Mutar / Desmutar Áudio** | Clique no botão `🔊` / `🔇` no cabeçalho |
+| **Atualizar IP/ISP** | Duplo clique no badge com o globo `🌐` |
+| **Ver Latência e Hora** | Passe o mouse sobre os pontos do gráfico de vida |
+| **Editar Serviço** | Duplo clique sobre o card ou acesse a engrenagem `⚙` |
+| **Reordenar Alvos** | Acesse `⚙` e use os botões `▲` e `▼` |
+| **Escolher Sons MP3** | Acesse `⚙` e use o seletor com validação de até 3s e botão de preview |
+| **Ajustar Transparência**| Acesse `⚙` e deslize a barra de opacidade (20% a 100%) |
+| **Redimensionar** | Arraste o canto inferior direito (alça de redimensionamento) |
+| **Fixar no Topo** | Clique no botão `📌` (Always on Top) |
+| **Fechar o Programa** | Clique no botão `✕` (salva posições e encerra threads) |
+
+---
+
+## 📦 Gerando um Executável Standalone (`.exe`)
+
+Para compilar em um único arquivo executável sem a necessidade de ter o Python instalado na máquina de destino:
+
+```bash
+pip install pyinstaller
+python -m PyInstaller --noconsole --onefile --name "jacu_ia_monitor" jacu_monitor.py
+```
+
+O executável compilado estará disponível no caminho:
+```text
+dist/jacu_ia_monitor.exe

@@ -1,4 +1,4 @@
-# jacu.ia monitor (beta 0.1)
+# jacu.ia monitor (beta 0.5)
 
 > Gadget / HUD moderno e ultraleve para Windows 11 desenvolvido em Python (PyQt6) para monitoramento em tempo real de servidores, portas e endpoints.
 
@@ -7,6 +7,13 @@
 ## ⚡ Principais Recursos
 
 - **Modo Gadget / HUD Always-On-Top**: Pode ficar flutuando e fixado sobre qualquer janela de jogos, IDEs ou navegadores no Windows 11.
+- **Alertas Sonoros com MP3 (UP & DOWN)**:
+  - Toca arquivos `.mp3` configuráveis ao ocorrer transição de status (`up.mp3` e `down.mp3` por padrão).
+  - **Validação de Duração**: O sistema valida e aceita apenas arquivos de áudio de no **máximo 3 segundos**.
+  - **Botão Mute/Unmute no Cabeçalho**: Ative ou silencie os alertas sonoros diretamente no topo da janela com o botão `🔊` / `🔇`.
+  - Configuração visual com botão de teste (preview) e seleção de arquivo no painel `⚙`.
+- **Checagem de Origem em Tempo Real na Queda**:
+  - Quando um evento de queda (**DOWN**) é detectado, o sistema executa uma verificação imediata de IP e Operadora para registrar a rota real no exato momento da indisponibilidade.
 - **Detecção de IP Público & Operadora**: Mostra seu endereço de IP de origem e provedor/ISP em um badge no topo do painel. Atualizado automaticamente a cada **5 minutos** ou forçado com **duplo clique**.
 - **Transparência / Opacidade Ajustável**: Controle o nível de transparência da janela (de 20% a 100%) em tempo real.
 - **Gráfico de Vida (Sparkline) com Tooltip**:
@@ -25,7 +32,7 @@
 - **Gerenciamento em Tempo Real**:
   - Reordene seus serviços com as setas `▲` e `▼`.
   - Edite qualquer serviço com **duplo clique direto no card** ou através da tela de configurações (`⚙`).
-  - Salva automaticamente tamanho da janela, posição e configurações no arquivo `amonitorar.txt`.
+  - Salva automaticamente tamanho da janela, posição, sons e configurações no arquivo `amonitorar.txt`.
 
 ---
 
@@ -48,8 +55,10 @@ pip install PyQt6
 
 ### 3. Rodar o aplicativo
 ```bash
-python jacu_ia_monitor.py
+python jacu_monitor.py
 ```
+
+> **Dica**: Certifique-se de que os arquivos `up.mp3` e `down.mp3` (com duração de até 3 segundos cada) estejam na pasta do executável para ouvir os alertas sonoros.
 
 ---
 
@@ -58,10 +67,11 @@ python jacu_ia_monitor.py
 Para cada serviço cadastrado, um arquivo de log individual é mantido no diretório `logs/<id_servico>.log`.
 
 ### 📌 Política de Registro por Mudança de Status
-Para maximizar a eficiência e economizar disco:
+Para maximizar a precisão e economizar disco:
 1. **Status Inicial**: Gravado na primeira medição logo após o aplicativo iniciar ou após editar um serviço.
-2. **Mudança de Estado**: Só haverá nova gravação quando o serviço **cair** (`UP` $\rightarrow$ `DOWN`) ou **restabelecer** (`DOWN` $\rightarrow$ `UP`). Se o serviço continuar saudável ou continuar fora do ar, nenhum log redundante é adicionado.
-3. O gráfico de vida na tela continua recebendo medições em tempo real a cada intervalo definido.
+2. **Mudança de Estado**: Só haverá nova gravação quando o serviço **cair** (`UP` $\rightarrow$ `DOWN`) ou **restabelecer** (`DOWN` $\rightarrow$ `UP`).
+3. **Checagem de Queda Ativa**: No evento de `DOWN`, o aplicativo dispara uma verificação ativa de rede para capturar o IP de saída e a operadora vigentes naquele segundo exato.
+4. O gráfico de vida na tela continua recebendo medições em tempo real a cada intervalo definido.
 
 ### 📌 Especificação dos Campos (Formato Delimitado por `|`)
 
@@ -70,8 +80,8 @@ $$\text{TIMESTAMP} \mid \text{IP\_ORIGEM} \mid \text{OPERADORA} \mid \text{ALVO\
 | Posição | Campo | Descrição | Exemplo |
 | :--- | :--- | :--- | :--- |
 | **1** | `TIMESTAMP` | Data e hora exata da transição (`YYYY-MM-DD HH:MM:SS`) | `2026-11-11 08:52:10` |
-| **2** | `IP_ORIGEM` | Seu endereço IP público detectado no momento do evento | `177.136.24.12` |
-| **3** | `OPERADORA` | Nome do provedor/ISP da sua conexão | `Claro Brasil` |
+| **2** | `IP_ORIGEM` | Endereço IP público apurado no instante do evento | `177.136.24.12` |
+| **3** | `OPERADORA` | Nome do provedor/ISP da rota no momento da transição | `Claro Brasil` |
 | **4** | `ALVO` | Nome e endereço/URL do alvo monitorado | `Cloudflare DNS (1.1.1.1)` |
 | **5** | `STATUS` | Estado do serviço (`UP` ou `DOWN`) | `DOWN` |
 | **6** | `LATENCIA` | Latência da medição em milissegundos | `0.0` |
@@ -94,6 +104,9 @@ O arquivo `amonitorar.txt` é gerado automaticamente na raiz do projeto em forma
 ```json
 {
     "opacity": 92,
+    "sound_enabled": true,
+    "up_sound": "up.mp3",
+    "down_sound": "down.mp3",
     "window": {
         "x": 100,
         "y": 100,
@@ -128,10 +141,12 @@ O arquivo `amonitorar.txt` é gerado automaticamente na raiz do projeto em forma
 | Ação | Como Executar |
 | :--- | :--- |
 | **Mover a Janela** | Clique e arraste pelo topo da barra de título |
+| **Mutar / Desmutar Áudio** | Clique no botão `🔊` / `🔇` no cabeçalho |
 | **Atualizar IP/ISP** | Duplo clique no badge com o globo `🌐` |
 | **Ver Latência e Hora** | Passe o mouse sobre os pontos do gráfico de vida |
 | **Editar Serviço** | Duplo clique sobre o card ou acesse a engrenagem `⚙` |
 | **Reordenar Alvos** | Acesse `⚙` e use os botões `▲` e `▼` |
+| **Escolher Sons MP3** | Acesse `⚙` e use o seletor com validação de até 3s e botão de preview |
 | **Ajustar Transparência**| Acesse `⚙` e deslize a barra de opacidade (20% a 100%) |
 | **Redimensionar** | Arraste o canto inferior direito (alça de redimensionamento) |
 | **Fixar no Topo** | Clique no botão `📌` (Always on Top) |
@@ -145,7 +160,7 @@ Para compilar em um único arquivo executável sem a necessidade de ter o Python
 
 ```bash
 pip install pyinstaller
-python -m PyInstaller --noconsole --onefile --name "jacu_ia_monitor" jacu_ia_monitor.py
+python -m PyInstaller --noconsole --onefile --name "jacu_ia_monitor" jacu_monitor.py
 ```
 
 O executável compilado estará disponível no caminho:
